@@ -12,7 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-""" Finetuning a 🤗 Transformers model for sequence classification on GLUE."""
+
+# the codebase is basd on https://github.com/huggingface/transformers/blob/main/examples/pytorch/text-classification/boulder-final-project.py
+import evaluate
 import argparse
 import json
 import logging
@@ -21,10 +23,11 @@ import os
 import random
 from pathlib import Path
 from time import time
+import uuid
 
 import datasets
 import torch
-from datasets import load_dataset, load_metric
+from datasets import load_dataset
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
@@ -51,28 +54,10 @@ logger = get_logger(__name__)
 
 require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/text-classification/requirements.txt")
 
-task_to_keys = {
-    "cola": ("sentence", None),
-    "mnli": ("premise", "hypothesis"),
-    "mrpc": ("sentence1", "sentence2"),
-    "qnli": ("question", "sentence"),
-    "qqp": ("question1", "question2"),
-    "rte": ("sentence1", "sentence2"),
-    "sst2": ("sentence", None),
-    "stsb": ("sentence1", "sentence2"),
-    "wnli": ("sentence1", "sentence2"),
-}
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Finetune a transformers model on a text classification task")
-    parser.add_argument(
-        "--task_name",
-        type=str,
-        default=None,
-        help="The name of the glue task to train on.",
-        choices=list(task_to_keys.keys()),
-    )
     parser.add_argument(
         "--train_file", type=str, default=None, help="A csv or a json file containing the training data."
     )
@@ -137,6 +122,12 @@ def parse_args():
         help="Number of updates steps to accumulate before performing a backward/update pass.",
     )
     parser.add_argument(
+        "--project_suffix",
+        type=str,
+        default="",
+        help="Suffix to add to the project name for the sweep.",
+    )
+    parser.add_argument(
         "--lr_scheduler_type",
         type=SchedulerType,
         default="linear",
@@ -188,15 +179,9 @@ def parse_args():
     args = parser.parse_args()
 
     # Sanity checks
-    if args.task_name is None and args.train_file is None and args.validation_file is None:
+    if args.train_file is None and args.validation_file is None:
         raise ValueError("Need either a task name or a training/validation file.")
-    else:
-        if args.train_file is not None:
-            extension = args.train_file.split(".")[-1]
-            assert extension in ["csv", "json"], "`train_file` should be a csv or a json file."
-        if args.validation_file is not None:
-            extension = args.validation_file.split(".")[-1]
-            assert extension in ["csv", "json"], "`validation_file` should be a csv or a json file."
+    
 
     if args.push_to_hub:
         assert args.output_dir is not None, "Need an `output_dir` to create a repo when `--push_to_hub` is passed."
@@ -208,13 +193,13 @@ def main():
     args = parse_args()
     # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
     # information sent is the one passed as arguments along with your Python/PyTorch versions.
-    send_example_telemetry("run_glue_no_trainer", args)
+    send_example_telemetry("boulder-final-project", args)
 
     # Initialize the accelerator. We will let the accelerator handle device placement for us in this example.
     # If we're using tracking, we also need to initialize it here and it will by default pick up all supported trackers
     # in the environment
     accelerator = (
-        Accelerator(log_with=args.report_to, logging_dir=args.output_dir) if args.with_tracking else Accelerator()
+        Accelerator(log_with=args.report_to, project_dir=args.output_dir) if args.with_tracking else Accelerator()
     )
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
@@ -264,94 +249,57 @@ def main():
 
     # In distributed training, the load_dataset function guarantee that only one local process can concurrently
     # download the dataset.
-    if args.task_name is not None:
-        # Downloading and loading a dataset from the hub.
-        raw_datasets = load_dataset("glue", args.task_name, trust_remote_code=True)
-    else:
-        # Loading the dataset from local csv or json file.
-        data_files = {}
-        if args.train_file is not None:
-            data_files["train"] = args.train_file
-        if args.validation_file is not None:
-            data_files["validation"] = args.validation_file
-        extension = (args.train_file if args.train_file is not None else args.validation_file).split(".")[-1]
-        raw_datasets = load_dataset(extension, data_files=data_files, trust_remote_code=True)
+    # Loading the dataset from local csv or json file.
+    data_files = {}
+    if args.train_file is not None:
+        data_files["train"] = args.train_file
+    if args.validation_file is not None:
+        data_files["validation"] = args.validation_file
+    extension = (args.train_file if args.train_file is not None else args.validation_file).split(".")[-1]
+    raw_datasets = load_dataset(extension, data_files=data_files, trust_remote_code=True)
     # See more about loading any type of standard or custom dataset at
     # https://huggingface.co/docs/datasets/loading_datasets.html.
 
     is_regression = False
     # Labels
-    if args.task_name is not None:
-        is_regression = args.task_name == "stsb"
-        if not is_regression:
-            label_list = raw_datasets["train"].features["label"].names
-            num_labels = len(label_list)
-        else:
-            num_labels = 1
-    else:
-        # Trying to have good defaults here, don't hesitate to tweak to your needs.
-        raw_datasets["train"] = raw_datasets["train"].map(lambda x: {'label': x['sentiment'] == 'positive'})
-        is_regression = False
-        label_list = raw_datasets["train"].unique("label")
-        label_list.sort()  # Let's sort it for determinism
-        num_labels = len(label_list)
+
+    label_list = raw_datasets["train"].unique("mapped_sentiment")
+    label_list.sort()  # Let's sort it for determinism
+    num_labels = len(label_list)
 
     # Load pretrained model and tokenizer
     #
     # In distributed training, the .from_pretrained methods guarantee that only one local process can concurrently
     # download model & vocab.
-    config = AutoConfig.from_pretrained(args.model_name_or_path, num_labels=num_labels, finetuning_task=args.task_name)
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=not args.use_slow_tokenizer)
+    config = AutoConfig.from_pretrained(args.model_name_or_path, num_labels=num_labels, finetuning_task=None, token='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')
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=not args.use_slow_tokenizer, token='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')
     model = AutoModelForSequenceClassification.from_pretrained(
         args.model_name_or_path,
         from_tf=bool(".ckpt" in args.model_name_or_path),
         config=config,
         ignore_mismatched_sizes=args.ignore_mismatched_sizes,
+        token = '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'
     )
 
     # Preprocessing the datasets
-    if args.task_name is not None:
-        sentence1_key, sentence2_key = task_to_keys[args.task_name]
+    
+    non_label_column_names = [name for name in raw_datasets["train"].column_names if name == 'reviewText']
+    if "sentence1" in non_label_column_names and "sentence2" in non_label_column_names:
+        sentence1_key, sentence2_key = "sentence1", "sentence2"
     else:
-        # Again, we try to have some nice defaults but don't hesitate to tweak to your use case.
-        non_label_column_names = [name for name in raw_datasets["train"].column_names if name == 'reviewText']
-        if "sentence1" in non_label_column_names and "sentence2" in non_label_column_names:
-            sentence1_key, sentence2_key = "sentence1", "sentence2"
+        if len(non_label_column_names) >= 2:
+            sentence1_key, sentence2_key = non_label_column_names[:2]
         else:
-            if len(non_label_column_names) >= 2:
-                sentence1_key, sentence2_key = non_label_column_names[:2]
-            else:
-                sentence1_key, sentence2_key = non_label_column_names[0], None
+            sentence1_key, sentence2_key = non_label_column_names[0], None
 
     # Some models have set the order of the labels to use, so let's make sure we do use it.
     label_to_id = None
-    if (
-        model.config.label2id != PretrainedConfig(num_labels=num_labels).label2id
-        and args.task_name is not None
-        and not is_regression
-    ):
-        # Some have all caps in their config, some don't.
-        label_name_to_id = {k.lower(): v for k, v in model.config.label2id.items()}
-        if list(sorted(label_name_to_id.keys())) == list(sorted(label_list)):
-            logger.info(
-                f"The configuration of the model provided the following label correspondence: {label_name_to_id}. "
-                "Using it!"
-            )
-            label_to_id = {i: label_name_to_id[label_list[i]] for i in range(num_labels)}
-        else:
-            logger.warning(
-                "Your model seems to have been trained with labels, but they don't match the dataset: ",
-                f"model labels: {list(sorted(label_name_to_id.keys()))}, dataset labels: {list(sorted(label_list))}."
-                "\nIgnoring the model labels as a result.",
-            )
-    elif args.task_name is None and not is_regression:
+
+    if not is_regression:
         label_to_id = {v: i for i, v in enumerate(label_list)}
 
     if label_to_id is not None:
         model.config.label2id = label_to_id
-        model.config.id2label = {id: label for label, id in config.label2id.items()}
-    elif args.task_name is not None and not is_regression:
-        model.config.label2id = {l: i for i, l in enumerate(label_list)}
         model.config.id2label = {id: label for label, id in config.label2id.items()}
 
     padding = "max_length" if args.pad_to_max_length else False
@@ -363,24 +311,24 @@ def main():
         )
         result = tokenizer(*texts, padding=padding, max_length=args.max_length, truncation=True)
 
-        if "label" in examples:
+        if "mapped_sentiment" in examples:
             if label_to_id is not None:
                 # Map labels to IDs (not necessary for GLUE tasks)
-                result["labels"] = [label_to_id[l] for l in examples["label"]]
+                result["labels"] = [label_to_id[l] for l in examples["mapped_sentiment"]]
             else:
                 # In all cases, rename the column to labels because the model will expect that.
-                result["labels"] = examples["label"]
+                result["labels"] = examples["mapped_sentiment"]
         return result
 
     with accelerator.main_process_first():
-        processed_datasets = raw_datasets['train'].map(
+        processed_datasets = raw_datasets.map(
             preprocess_function,
             batched=True,
             remove_columns=raw_datasets["train"].column_names,
             desc="Running tokenizer on dataset",
         )
-    train_dataset = processed_datasets
-    eval_dataset = processed_datasets
+    train_dataset = processed_datasets["train"]
+    eval_dataset = processed_datasets["validation"]
 
     # Log a few random samples from the training set:
     for index in random.sample(range(len(train_dataset)), 3):
@@ -459,14 +407,13 @@ def main():
             experiment_config = vars(args)
             # TensorBoard cannot log Enums, need the raw value
             experiment_config["lr_scheduler_type"] = experiment_config["lr_scheduler_type"].value
-            accelerator.init_trackers("glue_no_trainer", experiment_config)
+            accelerator.init_trackers("boulder-final-project", experiment_config, init_kwargs={"wandb":{"name": args.model_name_or_path + "-" + args.project_suffix}})
 
     # Get the metric function
-    if args.task_name is not None:
-        metric = load_metric("glue", args.task_name)
-    else:
-        metric = load_metric("accuracy")
 
+    f1_metric = evaluate.load("f1")
+    precision = evaluate.load("precision")
+    recall = evaluate.load("recall")
     # Train!
     total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
@@ -554,20 +501,36 @@ def main():
                     references = references[: len(eval_dataloader.dataset) - samples_seen]
                 else:
                     samples_seen += references.shape[0]
-            metric.add_batch(
+            f1_metric.add_batch(
+                predictions=predictions,
+                references=references,
+            )
+            precision.add_batch(
+                predictions=predictions,
+                references=references,
+            )
+            recall.add_batch(
                 predictions=predictions,
                 references=references,
             )
         end_time = time()
         logger.info(f"Epoch {epoch} evaluation took {end_time-start_time} seconds")
 
-        eval_metric = metric.compute()
-        logger.info(f"epoch {epoch}: {eval_metric}")
+        f1_result = f1_metric.compute()
+        precision_result = precision.compute()
+        recall_result = recall.compute()
+        
+        
+        
+        
+        logger.info(f"epoch {epoch}: F1: {f1_result['f1']}, Precision: {precision_result['precision']}, Recall: {recall_result['recall']}")
 
         if args.with_tracking:
             accelerator.log(
                 {
-                    "accuracy" if args.task_name is not None else "glue": eval_metric,
+                    "eval_f1": f1_result["f1"],
+                    "eval_precision": precision_result["precision"],
+                    "eval_recall": recall_result["recall"],
                     "train_loss": total_loss.item() / len(train_dataloader),
                     "epoch": epoch,
                     "step": completed_steps,
@@ -604,29 +567,9 @@ def main():
             if args.push_to_hub:
                 repo.push_to_hub(commit_message="End of training", auto_lfs_prune=True)
 
-    if args.task_name == "mnli":
-        # Final evaluation on mismatched validation set
-        eval_dataset = processed_datasets["validation_mismatched"]
-        eval_dataloader = DataLoader(
-            eval_dataset, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size
-        )
-        eval_dataloader = accelerator.prepare(eval_dataloader)
-
-        model.eval()
-        for step, batch in enumerate(eval_dataloader):
-            outputs = model(**batch)
-            predictions = outputs.logits.argmax(dim=-1)
-            metric.add_batch(
-                predictions=accelerator.gather(predictions),
-                references=accelerator.gather(batch["labels"]),
-            )
-
-        eval_metric = metric.compute()
-        logger.info(f"mnli-mm: {eval_metric}")
-
     if args.output_dir is not None:
         with open(os.path.join(args.output_dir, "all_results.json"), "w") as f:
-            json.dump({"eval_accuracy": eval_metric["accuracy"]}, f)
+            json.dump({"f1": f1_result["f1"], "precision": precision_result["precision"], "recall": recall_result["recall"]}, f)
 
 
 if __name__ == "__main__":

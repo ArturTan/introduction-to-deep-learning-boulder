@@ -14,7 +14,7 @@ accelerate launch train.py \
   --with_tracking \
   --report_to "wandb"
 
-
+q
 # other models to test
 # BERT: bert-base-uncased
 # RoBERTa: roberta-base
